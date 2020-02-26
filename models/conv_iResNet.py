@@ -422,7 +422,8 @@ class conv_iResNet(nn.Module):
                  n_power_iter=5,
                  block=conv_iresnet_block,
                  actnorm=True, learn_prior=True,
-                 nonlin="relu"):
+                 nonlin="relu", cpc=False, sfa=False, time_depth=None,
+                 ):
         super(conv_iResNet, self).__init__()
         assert len(nBlocks) == len(nStrides) == len(nChannels)
         assert init_ds in (1, 2), "can only squeeze by 2"
@@ -435,6 +436,9 @@ class conv_iResNet(nn.Module):
         self.numTraceSamples = numTraceSamples if density_estimation else 0
         self.numSeriesTerms = numSeriesTerms if density_estimation else 0
         self.n_power_iter = n_power_iter
+        self.cpc = cpc
+        self.sfa = sfa
+        self.time_depth = time_depth
 
         print('')
         print(' == Building iResNet %d == ' % (sum(nBlocks) * 3 + 1))
@@ -454,6 +458,10 @@ class conv_iResNet(nn.Module):
         self._make_classifier(self.final_shape, nClasses)
         assert (nClasses is not None or density_estimation), "Must be either classifier or density estimator"
 
+        if self.cpc or self.sfa:
+            # check latent output dim, before: 3 * 32**2
+            self.final_batch_norm = nn.BatchNorm1d(256 * 8 * 8, affine=False)
+
     def _make_prior(self, learn_prior):
         dim = np.prod(self.in_shapes[0])
         self.prior_mu = nn.Parameter(torch.zeros((dim,)).float(), requires_grad=learn_prior)
@@ -471,6 +479,28 @@ class conv_iResNet(nn.Module):
         out = F.avg_pool2d(out, out.size(2))
         out = out.view(out.size(0), out.size(1))
         return self.logits(out)
+
+    def compute_cpc(self, z):
+        z = nn.Softmax(dim=1)(z)
+        H_yx = - torch.mean(torch.sum(z * torch.log(z + 1e-10), dim=1))
+        P_y = torch.mean(z, dim=0)
+        H_y = - torch.sum(P_y * torch.log(P_y + 1e-10))
+        # normalize
+        H_yx = H_yx / np.log(256 * 8 * 8)
+        H_y = H_y / np.log(256 * 8 * 8)
+        #I_yx = (H_y - H_yx) / np.log(256 * 8 * 8)
+        return H_yx, H_y  # I_yx
+
+    def compute_sfa(self, z):
+        z = torch.stack(torch.split(z, self.time_depth), 1)
+        # straight
+        diff = .5 * z[:-2] + .5 * z[2:] - z[1:-1]
+        straightness = torch.mean(diff**2)
+        # sparseness
+        L1_img = torch.mean(torch.abs(z))
+        diff = z[1:] - z[:-1]
+        L1_trans = torch.mean(torch.abs(diff))
+        return straightness, L1_img, L1_trans
 
     def prior(self):
         return distributions.Normal(self.prior_mu, torch.exp(self.prior_logstd))
@@ -559,6 +589,20 @@ class conv_iResNet(nn.Module):
 
             logpz = self.logpz(z)
             return z, logpz, tmp_trace
+
+        elif self.cpc or self.sfa:
+            z_flat = z.view(-1, 256 * 8 * 8)
+            #z_flat = self.final_batch_norm(z_flat)
+
+            # cpc head
+            if self.cpc:
+                cond_ent, marginal_ent = self.compute_cpc(z_flat)
+                return (cond_ent, marginal_ent), z
+
+            # sfa head
+            if self.sfa:
+                straightness, L1_img, L1_trans = self.compute_sfa(z_flat)
+                return (straightness, L1_img, L1_trans), z
 
         # classification head
         else:

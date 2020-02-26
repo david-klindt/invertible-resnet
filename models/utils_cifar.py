@@ -4,7 +4,7 @@ import torch.optim as optim
 import torchvision.utils
 from torch.autograd import Variable
 from torch._six import inf
-from models.viz_utils import line_plot, scatter_plot, images_plot
+#from models.viz_utils import line_plot, scatter_plot, images_plot
 import os
 import sys
 import math
@@ -77,7 +77,8 @@ def try_make_dir(d):
         os.mkdir(d)
 
 
-def train(args, model, optimizer, epoch, trainloader, trainset, viz, use_cuda, train_log):
+def train(args, model, optimizer, epoch, trainloader, trainset, use_cuda,
+          train_log, trainloader_sfa=None, trainset_sfa=None, viz=None):
     model.train()
     correct = 0
     total = 0
@@ -89,10 +90,14 @@ def train(args, model, optimizer, epoch, trainloader, trainset, viz, use_cuda, t
     else:
         lr = args.lr
 
-    params = sum([np.prod(p.size()) for p in model.parameters()])
-    print('|  Number of Trainable Parameters: ' + str(params))
-    print('\n=> Training Epoch #%d, LR=%.4f' % (epoch, lr))
-          
+    print('\n=> Training Epoch #%d, LR=%.4f' % (epoch, lr), file=train_log)
+
+    running_loss = [0.0, 0.0]  # total, cross ent.
+    if args.cpc:
+        running_loss += [0.0, 0.0]  # cond and marg. entropy
+    elif args.sfa:
+        running_loss += [0.0, 0.0, 0.0]  # sfa, sparseness, sparse transition
+        trainloader_sfa = iter(trainloader_sfa)
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         cur_iter = (epoch - 1) * len(trainloader) + batch_idx
         # if first epoch use warmup
@@ -112,9 +117,45 @@ def train(args, model, optimizer, epoch, trainloader, trainset, viz, use_cuda, t
             # compute loss
             logpx = logpz + trace
             loss = bits_per_dim(logpx, inputs).mean()
-        else: # classification
+        elif args.cpc or args.sfa:
+            if args.cpc:
+                (cond_ent, marg_ent), _ = model(inputs)  # mutual_info
+                loss = args.cond_ent_weight * cond_ent - \
+                       args.marg_ent_weight * marg_ent
+                running_loss[2] += cond_ent.item()
+                running_loss[3] += marg_ent.item()
+            elif args.sfa:
+                inputs_sfa = next(trainloader_sfa)
+                if use_cuda:
+                    inputs_sfa = inputs_sfa.cuda()  # GPU settings
+                (straightness, L1_img, L1_trans), z = model(inputs_sfa)
+                loss = args.straightness_weight * straightness + \
+                       args.L1_img_weight * L1_img + \
+                       args.L1_trans_weight * L1_trans
+                running_loss[2] += straightness.item()
+                running_loss[3] += L1_img.item()
+                running_loss[4] += L1_trans.item()
+            if args.ce_weight > 0:
+                if use_cuda:
+                    model.module.sfa = False
+                    model.module.cpc = False
+                else:
+                    model.sfa = False
+                    model.cpc = False
+                out, _ = model(inputs)
+                ce_loss = criterion(out, targets)  # Cross Entropy Loss
+                running_loss[1] += ce_loss.item()
+                loss += args.ce_weight * ce_loss
+                if use_cuda:
+                    model.module.sfa = args.sfa
+                    model.module.cpc = args.cpc
+                else:
+                    model.sfa = args.sfa
+                    model.cpc = args.cpc
+        else:  # classification
             out, _ = model(inputs)
-            loss = criterion(out, targets) # Loss
+            loss = criterion(out, targets)  # Loss
+        running_loss[0] += loss.item()
         
         # logging for sigmas. NOTE: needs to be done before backward-call
         if args.densityEstimation and args.log_verbose:
@@ -125,13 +166,27 @@ def train(args, model, optimizer, epoch, trainloader, trainset, viz, use_cuda, t
                         sigma = model.state_dict()[k[:-5] + '_sigma']
                         sigmas.append(sigma.item())
                 sigmas = np.array(sigmas)
-                line_plot(viz, "sigma all layers", cur_iter, sigmas)
+                if viz is not None:
+                    line_plot(viz, "sigma all layers", cur_iter, sigmas)
                 
         loss.backward()  # Backward Propagation
         optimizer.step()  # Optimizer update
-                
-        if args.densityEstimation: # logging for density estimation
-            if batch_idx % args.log_every == 0:
+
+        # logging
+        if batch_idx % args.log_every == 0 and batch_idx > 1:
+            running_loss = [r / args.log_every for r in running_loss]
+            # check inverse stability (MSE of reconstruction
+            _, z = model(inputs)
+            rec = model.module.inverse(z) if use_cuda else model.inverse(z)
+            mse = torch.mean((inputs - rec) ** 2)
+
+            output = '\n| Epoch [%3d/%3d] Iter[%3d/%3d]\t\tTotal Loss: ' \
+                     '%.4f, Reconstruction MSE: %.4e' % (
+                         epoch, args.epochs, batch_idx + 1,
+                         (len(trainset) // args.batch) + 1, running_loss[0],
+                         mse)
+
+            if args.densityEstimation: # logging for density estimation
                 mean_trace = trace.mean().item()
                 mean_logpz = logpz.mean().item()
                 sys.stdout.write('\r')
@@ -139,9 +194,10 @@ def train(args, model, optimizer, epoch, trainloader, trainset, viz, use_cuda, t
                                  % (epoch, args.epochs, batch_idx+1,
                                     (len(trainset)//args.batch)+1, loss,  mean_trace, mean_logpz))
                 sys.stdout.flush()
-                line_plot(viz, "bits/dim", cur_iter, loss.item())
-                line_plot(viz, "logp(z)", cur_iter, mean_logpz)
-                line_plot(viz, "log|df/dz|", cur_iter, mean_trace)
+                if viz is not None:
+                    line_plot(viz, "bits/dim", cur_iter, loss.item())
+                    line_plot(viz, "logp(z)", cur_iter, mean_logpz)
+                    line_plot(viz, "log|df/dz|", cur_iter, mean_trace)
                 # file logging
                 log_dict = {"iter": cur_iter, "loss": loss.item(), "logpz": mean_logpz, "logdet": mean_trace, "epoch": epoch}
                 train_log.write("{}\n".format(json.dumps(log_dict)))
@@ -150,8 +206,9 @@ def train(args, model, optimizer, epoch, trainloader, trainset, viz, use_cuda, t
                 if args.log_verbose:
                     # grad_norm_2 = sum((p.grad.norm()**2).item() for p in model.parameters() if p.grad is not None)
                     grad_norm_inf = max(p.grad.data.abs().max().item() for p in model.parameters() if p.grad is not None)
-                    # line_plot(viz, "grad_norm_2", cur_iter, grad_norm_2)
-                    line_plot(viz, "grad_norm_inf", cur_iter, grad_norm_inf)
+                    if viz is not None:
+                        # line_plot(viz, "grad_norm_2", cur_iter, grad_norm_2)
+                        line_plot(viz, "grad_norm_inf", cur_iter, grad_norm_inf)
                     # log actnorm scaling
                     if not args.noActnorm:
                         actnorm_scales = []
@@ -168,30 +225,42 @@ def train(args, model, optimizer, epoch, trainloader, trainset, viz, use_cuda, t
                         actnorm_scales = np.array(actnorm_scales)
                         actnorm_scales_min = np.array(actnorm_scales_min)
                         actnorm_l2 = np.array(actnorm_l2)
-                        line_plot(viz, "max actnorm scale per layer", cur_iter, actnorm_scales)
-                        line_plot(viz, "min actnorm scale per layer", cur_iter, actnorm_scales_min)
-                        line_plot(viz, "l2 norm of actnorm scale per layer", cur_iter, actnorm_l2)  
+                        if viz is not None:
+                            line_plot(viz, "max actnorm scale per layer", cur_iter, actnorm_scales)
+                            line_plot(viz, "min actnorm scale per layer", cur_iter, actnorm_scales_min)
+                            line_plot(viz, "l2 norm of actnorm scale per layer", cur_iter, actnorm_l2)
                     # learned prior logging
                     if not args.fixedPrior:
                         prior_scales_max = torch.max(model.state_dict()['module.prior_logstd'])
                         prior_scales_min = torch.min(model.state_dict()['module.prior_logstd'])
-                        line_plot(viz, "max prior scale", cur_iter, prior_scales_max.item())
-                        line_plot(viz, "min prior scale", cur_iter, prior_scales_min.item())  
+                        if viz is not None:
+                            line_plot(viz, "max prior scale", cur_iter, prior_scales_max.item())
+                            line_plot(viz, "min prior scale", cur_iter, prior_scales_min.item())
 
-        else: # logging for classification
-            _, predicted = torch.max(out.data, 1)
-            total += targets.size(0)
-            correct += predicted.eq(targets.data).cpu().sum()    
-            if batch_idx % 1 == 0:
-                sys.stdout.write('\r')
-                sys.stdout.write('| Epoch [%3d/%3d] Iter[%3d/%3d]\t\tLoss: %.4f Acc@1: %.3f'
-                                 % (epoch, args.epochs, batch_idx+1,
-                                    (len(trainset)//args.batch)+1, loss.data.item(),
-                                    100.*correct.type(torch.FloatTensor)/float(total)))
-                sys.stdout.flush()
+            elif args.cpc:  # logging for cpc
+                output += '\nH[z|x]: %.4f, H[z]: %.4f, I[x; z]: %.4f' % (
+                    running_loss[2], running_loss[3],
+                    running_loss[3] - running_loss[2]
+                )
+            elif args.sfa:   # logging for  sfa
+                output += '\nStraightness: %.4e, L1_img: %.4e, L1_trans: ' \
+                          '%.4e' % tuple(running_loss[2:])
+
+            if args.ce_weight > 0:  # logging for classification
+                _, predicted = torch.max(out.data, 1)
+                total += targets.size(0)
+                correct += predicted.eq(targets.data).cpu().sum()
+                output += ', Cross Entropy: %.4e, Acc@1: %.3f' % (
+                    running_loss[1],
+                    100. * correct.type(torch.FloatTensor) / float(total)
+                )
+
+            print(output, file=train_log)
+            running_loss = [0.0 for r in running_loss]
 
 
-def test(best_result, args, model, epoch, testloader, viz, use_cuda, test_log):
+def test(best_result, args, model, epoch, testloader, use_cuda, test_log,
+         viz=None):
     model.eval()
     objective = 0.
     total = 0
@@ -211,7 +280,8 @@ def test(best_result, args, model, epoch, testloader, viz, use_cuda, test_log):
             if batch_idx == 0:
                 x_re = model.module.inverse(z, 10) if use_cuda else model.inverse(z, 10)
                 err = (inputs - x_re).abs().sum()
-                line_plot(viz, "recons err", epoch, err.item())
+                if viz is not None:
+                    line_plot(viz, "recons err", epoch, err.item())
                 bs = inputs.size(0)
                 samples = model.module.sample(bs, 10) if use_cuda else model.sample(bs, 10)
                 im_dir = os.path.join(args.save_dir, 'ims')
@@ -225,9 +295,10 @@ def test(best_result, args, model, epoch, testloader, viz, use_cuda, test_log):
                 torchvision.utils.save_image(x_re.cpu(),
                                              os.path.join(im_dir, "recons_{}.jpg".format(epoch)),
                                              int(bs ** .5), normalize=True)
-                images_plot(viz, "data", out_im(inputs).cpu())
-                images_plot(viz, "recons", out_im(x_re).cpu())
-                images_plot(viz, "samples", out_im(samples).cpu())
+                if viz is not None:
+                    images_plot(viz, "data", out_im(inputs).cpu())
+                    images_plot(viz, "recons", out_im(x_re).cpu())
+                    images_plot(viz, "samples", out_im(samples).cpu())
                 del x_re, err, samples
 
             del z, logpz, trace, logpx, loss
@@ -242,7 +313,8 @@ def test(best_result, args, model, epoch, testloader, viz, use_cuda, test_log):
         del inputs, targets
 
     objective = float(objective) / float(total)
-    line_plot(viz, "test bits/dim" if args.densityEstimation else "test acc", epoch, objective)
+    if viz is not None:
+        line_plot(viz, "test bits/dim" if args.densityEstimation else "test acc", epoch, objective)
     print("\n| Validation Epoch #%d\t\t\tobjective =  %.4f" % (epoch, objective), flush=True)
     if objective > best_result:
         print('\n| Saving Best model...\t\t\tobjective = %.4f%%' % (objective), flush=True)
